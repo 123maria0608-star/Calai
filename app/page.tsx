@@ -1,25 +1,53 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { useEffect, useMemo, useRef, useState } from "react";
+import AddFoodMenu from "./components/AddFoodMenu";
+import GramsEntry from "./components/GramsEntry";
+import PantryList from "./components/PantryList";
+import SearchIngredient from "./components/SearchIngredient";
 import { fileToCompressedBase64, makeThumbnail } from "./lib/image";
+import { lookupBarcode } from "./lib/openfoodfacts";
 import {
   dateKey,
   loadGoals,
   loadLog,
+  loadPantry,
   saveGoals,
   saveLog,
+  savePantry,
+  touchPantryItem,
+  upsertPantryItem,
 } from "./lib/storage";
-import { DEFAULT_GOALS, Goals, LogEntry, ScanResult } from "./lib/types";
+import {
+  DEFAULT_GOALS,
+  Goals,
+  LogEntry,
+  PantryItem,
+  ScanResult,
+  pantryItemToScanResult,
+} from "./lib/types";
+
+// Barcode scanner uses the camera — load only on the client.
+const BarcodeScanner = dynamic(() => import("./components/BarcodeScanner"), {
+  ssr: false,
+});
 
 type Stage =
   | { kind: "idle" }
-  | { kind: "scanning"; preview: string }
+  | { kind: "menu" }
+  | { kind: "search" }
+  | { kind: "barcode" }
+  | { kind: "barcode-loading"; code: string }
+  | { kind: "scanning-photo"; preview: string }
   | { kind: "review"; preview: string; result: ScanResult; hint: string }
+  | { kind: "grams"; item: PantryItem; afterAdd?: "log" | "pantry-only" }
   | { kind: "error"; message: string };
 
 export default function Home() {
   const [log, setLog] = useState<LogEntry[]>([]);
   const [goals, setGoals] = useState<Goals>(DEFAULT_GOALS);
+  const [pantry, setPantry] = useState<PantryItem[]>([]);
   const [stage, setStage] = useState<Stage>({ kind: "idle" });
   const [showGoals, setShowGoals] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -27,69 +55,99 @@ export default function Home() {
   useEffect(() => {
     setLog(loadLog());
     setGoals(loadGoals());
+    setPantry(loadPantry());
   }, []);
 
   const today = useMemo(() => dateKey(), []);
   const todays = useMemo(() => log.filter((e) => e.dateKey === today), [log, today]);
 
-  const totals = useMemo(() => {
-    return todays.reduce(
-      (acc, e) => ({
-        kcal: acc.kcal + e.result.total_kcal,
-        protein_g: acc.protein_g + e.result.total_protein_g,
-        carbs_g: acc.carbs_g + e.result.total_carbs_g,
-        fat_g: acc.fat_g + e.result.total_fat_g,
-      }),
-      { kcal: 0, protein_g: 0, carbs_g: 0, fat_g: 0 },
-    );
-  }, [todays]);
+  const totals = useMemo(
+    () =>
+      todays.reduce(
+        (acc, e) => ({
+          kcal: acc.kcal + e.result.total_kcal,
+          protein_g: acc.protein_g + e.result.total_protein_g,
+          carbs_g: acc.carbs_g + e.result.total_carbs_g,
+          fat_g: acc.fat_g + e.result.total_fat_g,
+        }),
+        { kcal: 0, protein_g: 0, carbs_g: 0, fat_g: 0 },
+      ),
+    [todays],
+  );
 
   function persistLog(next: LogEntry[]) {
     setLog(next);
     saveLog(next);
   }
-
   function persistGoals(g: Goals) {
     setGoals(g);
     saveGoals(g);
   }
+  function persistPantry(next: PantryItem[]) {
+    setPantry(next);
+    savePantry(next);
+  }
 
-  async function handleFile(file: File) {
+  /* --- pantry actions --- */
+
+  function addPantryItem(item: PantryItem) {
+    const next = upsertPantryItem(pantry, item);
+    persistPantry(next);
+  }
+
+  function deletePantryItem(id: string) {
+    persistPantry(pantry.filter((it) => it.id !== id));
+  }
+
+  function logFromPantry(item: PantryItem, grams: number) {
+    const result = pantryItemToScanResult(item, grams);
+    const entry: LogEntry = {
+      id: crypto.randomUUID(),
+      ts: Date.now(),
+      dateKey: dateKey(),
+      thumbnail: item.thumbnail,
+      result,
+      pantryItemId: item.id,
+      grams,
+    };
+    persistLog([entry, ...log]);
+    persistPantry(touchPantryItem(pantry, item.id, grams));
+    setStage({ kind: "idle" });
+  }
+
+  /* --- photo scan --- */
+
+  async function handlePhoto(file: File) {
     try {
       const { base64, mediaType } = await fileToCompressedBase64(file);
       const preview = `data:${mediaType};base64,${base64}`;
-      setStage({ kind: "scanning", preview });
-
+      setStage({ kind: "scanning-photo", preview });
       const res = await fetch("/api/scan", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ image: base64, mediaType }),
       });
-
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
         setStage({ kind: "error", message: err.error ?? "Scan failed" });
         return;
       }
-
       const result = (await res.json()) as ScanResult;
       if (!result.is_food) {
-        setStage({
-          kind: "error",
-          message: "That doesn't look like food. Try another photo.",
-        });
+        setStage({ kind: "error", message: "That doesn't look like food." });
         return;
       }
-
       setStage({ kind: "review", preview, result, hint: "" });
     } catch (e) {
-      const message = e instanceof Error ? e.message : "Something went wrong";
-      setStage({ kind: "error", message });
+      setStage({
+        kind: "error",
+        message: e instanceof Error ? e.message : "Scan failed",
+      });
     }
   }
 
   async function rescanWithHint(preview: string, hint: string) {
-    setStage({ kind: "scanning", preview });
+    setStage({ kind: "scanning-photo", preview });
     const base64 = preview.split(",")[1] ?? "";
     const res = await fetch("/api/scan", {
       method: "POST",
@@ -105,7 +163,7 @@ export default function Home() {
     setStage({ kind: "review", preview, result, hint });
   }
 
-  async function commitEntry(preview: string, result: ScanResult) {
+  async function commitScanEntry(preview: string, result: ScanResult) {
     const base64 = preview.split(",")[1] ?? "";
     const thumbnail = await makeThumbnail(base64);
     const entry: LogEntry = {
@@ -119,33 +177,66 @@ export default function Home() {
     setStage({ kind: "idle" });
   }
 
-  function deleteEntry(id: string) {
-    persistLog(log.filter((e) => e.id !== id));
+  /* --- barcode --- */
+
+  async function handleBarcode(code: string) {
+    setStage({ kind: "barcode-loading", code });
+    try {
+      const item = await lookupBarcode(code);
+      if (!item) {
+        setStage({
+          kind: "error",
+          message: `No nutrition data for barcode ${code}. Try search instead.`,
+        });
+        return;
+      }
+      addPantryItem(item);
+      setStage({ kind: "grams", item });
+    } catch (e) {
+      setStage({
+        kind: "error",
+        message: e instanceof Error ? e.message : "Barcode lookup failed",
+      });
+    }
   }
+
+  /* --- render --- */
 
   return (
     <main className="mx-auto max-w-md px-5 pb-32 pt-8">
       <Header onOpenGoals={() => setShowGoals(true)} />
 
       <DailyRing totals={totals} goals={goals} />
-
       <MacroBars totals={totals} goals={goals} />
 
       <h2 className="mt-8 text-sm font-medium uppercase tracking-wider text-ink/50">
         Today
       </h2>
-
       {todays.length === 0 ? (
         <p className="mt-3 text-ink/60">
-          No scans yet today. Tap <span className="font-medium">Scan food</span> below.
+          No scans yet today. Tap{" "}
+          <span className="font-medium">+ Add food</span> below.
         </p>
       ) : (
         <ul className="mt-3 space-y-2">
           {todays.map((e) => (
-            <LogRow key={e.id} entry={e} onDelete={() => deleteEntry(e.id)} />
+            <LogRow
+              key={e.id}
+              entry={e}
+              onDelete={() => persistLog(log.filter((x) => x.id !== e.id))}
+            />
           ))}
         </ul>
       )}
+
+      <h2 className="mt-8 text-sm font-medium uppercase tracking-wider text-ink/50">
+        Pantry
+      </h2>
+      <PantryList
+        items={pantry}
+        onTap={(item) => setStage({ kind: "grams", item })}
+        onDelete={deletePantryItem}
+      />
 
       <input
         ref={fileRef}
@@ -156,13 +247,52 @@ export default function Home() {
         onChange={(ev) => {
           const f = ev.target.files?.[0];
           ev.target.value = "";
-          if (f) void handleFile(f);
+          if (f) void handlePhoto(f);
         }}
       />
 
-      <ScanButton onClick={() => fileRef.current?.click()} />
+      <AddButton onClick={() => setStage({ kind: "menu" })} />
 
-      {stage.kind === "scanning" && <ScanningOverlay preview={stage.preview} />}
+      {stage.kind === "menu" && (
+        <AddFoodMenu
+          onClose={() => setStage({ kind: "idle" })}
+          onChoosePhoto={() => {
+            setStage({ kind: "idle" });
+            fileRef.current?.click();
+          }}
+          onChooseSearch={() => setStage({ kind: "search" })}
+          onChooseBarcode={() => setStage({ kind: "barcode" })}
+        />
+      )}
+
+      {stage.kind === "search" && (
+        <SearchIngredient
+          onClose={() => setStage({ kind: "idle" })}
+          onFound={(item) => {
+            addPantryItem(item);
+            setStage({ kind: "grams", item });
+          }}
+        />
+      )}
+
+      {stage.kind === "barcode" && (
+        <BarcodeScanner
+          onCancel={() => setStage({ kind: "idle" })}
+          onDetected={(code) => void handleBarcode(code)}
+        />
+      )}
+
+      {stage.kind === "barcode-loading" && (
+        <CenterOverlay>
+          <Spinner />
+          <span className="text-sm text-ink/70">Looking up {stage.code}…</span>
+        </CenterOverlay>
+      )}
+
+      {stage.kind === "scanning-photo" && (
+        <ScanningOverlay preview={stage.preview} />
+      )}
+
       {stage.kind === "review" && (
         <ReviewSheet
           preview={stage.preview}
@@ -187,9 +317,18 @@ export default function Home() {
               },
             });
           }}
-          onAdd={() => commitEntry(stage.preview, stage.result)}
+          onAdd={() => commitScanEntry(stage.preview, stage.result)}
         />
       )}
+
+      {stage.kind === "grams" && (
+        <GramsEntry
+          item={stage.item}
+          onCancel={() => setStage({ kind: "idle" })}
+          onConfirm={(g) => logFromPantry(stage.item, g)}
+        />
+      )}
+
       {stage.kind === "error" && (
         <ErrorOverlay
           message={stage.message}
@@ -218,7 +357,7 @@ function Header({ onOpenGoals }: { onOpenGoals: () => void }) {
     <div className="flex items-center justify-between">
       <div>
         <h1 className="font-display text-3xl">Calai</h1>
-        <p className="text-sm text-ink/60">Snap your food.</p>
+        <p className="text-sm text-ink/60">Snap, search, scan. Hit your goal.</p>
       </div>
       <button
         onClick={onOpenGoals}
@@ -269,7 +408,9 @@ function DailyRing({ totals, goals }: { totals: Goals; goals: Goals }) {
           {Math.round(totals.kcal)}
         </div>
         <div className="text-sm text-ink/60">
-          {over ? `${Math.round(totals.kcal - goals.kcal)} over` : `${Math.round(remaining)} left`}
+          {over
+            ? `${Math.round(totals.kcal - goals.kcal)} over`
+            : `${Math.round(remaining)} left`}
           <span className="text-ink/40"> · goal {goals.kcal}</span>
         </div>
       </div>
@@ -335,12 +476,16 @@ function LogRow({ entry, onDelete }: { entry: LogEntry; onDelete: () => void }) 
           className="h-14 w-14 flex-none rounded-xl object-cover"
         />
       ) : (
-        <div className="h-14 w-14 flex-none rounded-xl bg-ink/10" />
+        <div className="flex h-14 w-14 flex-none items-center justify-center rounded-xl bg-ink/5 text-lg">
+          {entry.pantryItemId ? "🥗" : "🍽️"}
+        </div>
       )}
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm font-medium">{title}</div>
         <div className="text-xs text-ink/50">
-          {time} · P {Math.round(entry.result.total_protein_g)}g · C{" "}
+          {time}
+          {entry.grams ? ` · ${entry.grams}g` : ""} · P{" "}
+          {Math.round(entry.result.total_protein_g)}g · C{" "}
           {Math.round(entry.result.total_carbs_g)}g · F{" "}
           {Math.round(entry.result.total_fat_g)}g
         </div>
@@ -361,36 +506,27 @@ function LogRow({ entry, onDelete }: { entry: LogEntry; onDelete: () => void }) 
   );
 }
 
-/* ------- big scan button ------- */
+/* ------- floating add button ------- */
 
-function ScanButton({ onClick }: { onClick: () => void }) {
+function AddButton({ onClick }: { onClick: () => void }) {
   return (
     <div className="fixed inset-x-0 bottom-0 z-10 flex justify-center pb-6">
       <button
         onClick={onClick}
         className="flex items-center gap-3 rounded-full bg-ink px-6 py-4 text-paper shadow-lg shadow-black/20 active:scale-[0.98]"
       >
-        <CameraIcon />
-        <span className="text-base font-medium">Scan food</span>
+        <span className="text-xl leading-none">+</span>
+        <span className="text-base font-medium">Add food</span>
       </button>
     </div>
   );
 }
 
-function CameraIcon() {
-  return (
-    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z" />
-      <circle cx="12" cy="13" r="4" />
-    </svg>
-  );
-}
-
-/* ------- scanning overlay ------- */
+/* ------- overlays ------- */
 
 function ScanningOverlay({ preview }: { preview: string }) {
   return (
-    <div className="fixed inset-0 z-20 flex flex-col items-center justify-center bg-paper/95 backdrop-blur">
+    <div className="fixed inset-0 z-30 flex flex-col items-center justify-center bg-paper/95 backdrop-blur">
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img
         src={preview}
@@ -405,13 +541,21 @@ function ScanningOverlay({ preview }: { preview: string }) {
   );
 }
 
+function CenterOverlay({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="fixed inset-0 z-30 flex flex-col items-center justify-center bg-paper/95 backdrop-blur">
+      <div className="flex items-center gap-3">{children}</div>
+    </div>
+  );
+}
+
 function Spinner() {
   return (
     <div className="h-4 w-4 animate-spin rounded-full border-2 border-ink/20 border-t-ink" />
   );
 }
 
-/* ------- review sheet ------- */
+/* ------- review sheet (photo scan) ------- */
 
 function ReviewSheet({
   preview,
@@ -600,9 +744,9 @@ function Macro({ label, value }: { label: string; value: number }) {
 
 function ErrorOverlay({ message, onClose }: { message: string; onClose: () => void }) {
   return (
-    <div className="fixed inset-0 z-20 flex items-center justify-center bg-black/40 px-6">
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 px-6">
       <div className="w-full max-w-sm rounded-3xl bg-paper p-6 text-center">
-        <div className="font-display text-xl">Couldn&apos;t scan that</div>
+        <div className="font-display text-xl">Something went wrong</div>
         <p className="mt-2 text-sm text-ink/70">{message}</p>
         <button
           onClick={onClose}
